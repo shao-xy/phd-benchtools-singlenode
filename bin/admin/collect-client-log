@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if test -d client-log/; then
+	echo "Fatal: mds-log directory exists."
+	exit 1
+fi
+
+mkdir client-log/
+for i in $(seq 0 4); do
+	cp /var/log/ceph/ceph-client.admin.log client-log/client.log
+done

@@ -1,0 +1,45 @@
+#!/bin/bash
+
+if test $# -ne 1; then
+	echo "Usage: $0 <dirname>"
+	exit 1
+fi
+
+cwd=$(pwd)
+
+EXE_DERIVE_MIGRATION=${cwd}/$(dirname $0)/derive_migration.sh
+
+# Test if starts with "log-", and insert "log-" before that if it doesn't
+target=$1
+if [[ "$target" != log-* ]]; then
+	target=log-$target
+fi
+echo $target
+
+if [ ! -d $target ] && [ ! -d bak/$target ] ; then
+	mkdir $target
+	mkdir bak/$target
+else
+	echo "dir $target exist"
+	exit 0
+fi
+
+for i in 0 1 2 3 4
+do
+	grep MDS_MONITOR mds-log/mds${i}.log | awk '{print $12}'  > $target/Inodes-mds$i
+	#grep MDS_MONITOR mds-log/mds${i}.log | awk '{print $10}'  > $target/Inodes-mds$i
+	grep MDS_MONITOR mds-log/mds${i}.log | awk '{print $8}'  > $target/IOPS-mds$i
+	grep MDS_MONITOR mds-log/mds${i}.log | awk '{print $10}'  > $target/FWPS-mds$i
+	#grep EXPORT_MONITOR mds-log/mds${i}-1.log | awk '{print $1 " " $2 " " $7 "\t" $8 "\t" $9}' | ${EXE_DERIVE_MIGRATION} > $target/migration-mds$i
+done
+
+cp -r mds-log bak/$target/mds-log
+cp -r client-log bak/$target/client-log
+mv mds-log $target/mds-log
+mv client-log $target/client-log
+#mv endtime/ $target/
+
+if test -f coll/endtime; then
+	cp coll/endtime bak/$target/
+	mv coll/endtime $target/
+fi

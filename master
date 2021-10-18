@@ -1,0 +1,126 @@
+#!/bin/bash
+
+# Change directory
+cd $(dirname $0)
+
+# Global variables
+g_workload=
+g_clients=
+g_target=
+g_nowait=
+
+# Predefined constants
+COLL_TIME=coll/endtime
+declare -A CMDS=(
+["ai"]="python3 /home/ceph/.local/lib/python3.6/site-packages/mxnet/tools/im2rec.py --list --recursive /mnt/ceph-client-\$idx/ai-record/\$idx /mnt/ceph-client-\$idx/ai/"
+["ycsb-zipf-init"]="./bin/workloads/ycsbc-zipf/ycsbc -db basic -threads 1 -P ./bin/ycsbc-zipf/workloads/zipfread.spec -n \$idx -mode l" 
+["ycsb-zipf-run"]="./bin/workloads/ycsbc-zipf/ycsbc -db basic -threads 1 -P ./bin/ycsbc-zipf/workloads/zipfread.spec -n \$idx -mode r"
+["fb_create_100k"]="./bin/workloads/filebench/fb_launcher fb_create_100k \$idx \$g_target"
+["kernel_compilation"]="make -C /mnt/ceph-client-\$idx/linux-5.1.12 -j16"
+["kernel_compilation_clean"]="make -C /mnt/ceph-client-\$idx/linux-5.1.12 -j16 clean"
+)
+
+function usage()
+{
+	sup_ops=
+	for cmd in ${!CMDS[@]}; do
+		sup_ops+=" $cmd"
+	done
+	echo "$0 <workload> <num_of_clients> [<target>] [<wait_or_not>]"
+	echo "   Supported workloads:$sup_ops"
+}
+
+function parse_args()
+{
+	if test $# -lt 2 -a $# -gt 4; then
+		usage
+		exit 1
+	fi
+	g_workload=$1
+	g_clients=$2
+	g_target=$3
+	g_nowait=$4
+	flag=false
+	for key in ${!CMDS[@]}; do
+		if [[ "$key" == "$g_workload" ]]; then
+			flag=true
+		fi
+	done
+	if [[ "$flag" == false ]]; then
+		echo "Fatal: unknown workload: $g_workload"
+		echo
+		usage
+		exit 1
+	fi
+}
+
+function init_clients()
+{
+	echo "[Sync] Acquire lock for modifying Ceph"
+	exe_lock acquire ceph-modify
+
+	remountfs $g_clients
+}
+
+function run_workloads()
+{
+	clog-mds
+	echo "Start: $(date)" > coll/endtime
+#	for i in $(seq 0 4); do
+#		ceph tell mds.mds16-$i config set debug_mds 3
+#		ceph tell mds.mds16-$i config set debug_mds_balancer 7
+#		ceph tell mds.mds16-$i config set debug_mds_migrator 3
+#	done
+	#export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+	b_notarget=0
+	if test -z $g_target; then
+		b_notarget=1
+	fi
+	for idx in $(seq 1 $g_clients); do
+		if [ $b_notarget -eq 1 ]; then
+			g_target=$idx
+		fi
+		(eval ${CMDS[$g_workload]}; echo "$g_workload $idx $(date)" >> $COLL_TIME) &
+	done
+	wait
+#	for i in $(seq 0 4); do
+#		ceph tell mds.mds16-$i config set debug_mds 0
+#		ceph tell mds.mds16-$i config set debug_mds_balancer 0
+#		ceph tell mds.mds16-$i config set debug_mds_migrator 0
+#	done
+
+	echo "[Sync] Release lock for modifying Ceph"
+	exe_lock release ceph-modify
+}
+
+function collect_and_analyze_logs()
+{
+	# Collect client log
+	if test -d client-log; then
+		mv client-log client-log.$(date +%Y%m%d-%H%M%S)
+	fi
+	./bin/admin/collect-client-log
+	# Collect MDS log
+	if test -d mds-log; then
+		mv mds-log mds-log.$(date +%Y%m%d-%H%M%S)
+	fi
+	./bin/admin/collect-mds-log
+}
+
+parse_args $@
+
+init_clients
+
+run_workloads
+
+collect_and_analyze_logs
+
+date
+set -x
+if [[ "$g_nowait" == "nowait" ]]; then
+	echo "No wait flag set. Automatically exiting in 30 seconds. Press [Enter] to immediately exit."
+	read -t 30
+else
+	echo "Press [Enter] to continue."
+	read
+fi

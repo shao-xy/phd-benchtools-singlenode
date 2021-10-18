@@ -1,0 +1,7 @@
+#!/bin/bash
+target=$1
+
+python3 $(dirname $0)/genInode.py $1
+python3 $(dirname $0)/genIops.py $1
+bash $(dirname $0)/genCV $1
+

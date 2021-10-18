@@ -1,0 +1,11 @@
+#!/bin/bash
+
+if test -d mds-log/; then
+	echo "Fatal: mds-log directory exists."
+	exit 1
+fi
+
+mkdir mds-log/
+for i in $(seq 0 4); do
+	cp /var/log/ceph/ceph-mds.mds16-$i.log mds-log/mds$i.log
+done

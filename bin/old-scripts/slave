@@ -1,0 +1,220 @@
+#!/bin/bash
+#
+# Benchmark runner and result sender
+#
+#####################################################
+# Global configuration
+#
+# My name
+NAME=`cat /etc/hostname`
+#
+# File system type, e.g., Ceph, Lustre, etc.
+FS=$1
+#
+# Number of clients this slave runs
+CLIENTS=$2
+#
+# Benchmark operation type, e.g., create, lookup, etc.
+BENCH_OP=$3
+#
+# Master/Dispatcher
+MASTER=$4
+#
+# Client - start
+CSTART=$5
+#
+# Client - end
+CEND=$6
+#
+# Logging for debug and monitor
+TAG="\033[1;33m[Logging $FS Slave $NAME]\033[0m"
+#
+# Flag - slave initialization
+FLAG_INIT=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/init
+#
+# FLag - slave initialization over
+FLAG_INIT_OVER=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/init_over
+#
+# Flag - slave start
+FLAG_START=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/start
+#
+# Flag - slave runs over
+FLAG_END=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/end
+#
+# Myself
+SLAVE=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/slave
+#
+# Local benchmark program
+SLAVE_BENCH=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/slave_bench
+#
+# To be continued...
+#####################################################
+
+#####################################################
+# Logging message
+# Globals:
+# 	TAG
+# Arguments:
+#	message
+# Return:
+#	Node
+#####################################################
+function slave_log(){
+	msg=$1
+	echo -e $TAG $msg
+}
+
+#####################################################
+# Notify master I have done something
+# Globals:
+# 	MASTER
+# Arguments:
+#	FLAG
+# Return:
+#	Node
+#####################################################
+function slave_notify(){
+	flag=$1
+	if [ $flag == "FLAG_INIT_OVER" ]; then
+		ssh $MASTER "echo $NAME >> $FLAG_INIT_OVER"
+	elif [ $flag == "FLAG_END" ]; then
+		ssh $MASTER "echo $NAME >> $FLAG_END"
+	fi
+}
+
+#####################################################
+# Upgrade slave and slave_bench if necessary
+# Globals:
+# 	TAG
+# Arguments:
+#	None
+# Return:
+#	None
+#####################################################
+function check_upgrade() {
+	slave_log "Checking master's slave and slave_bench version..."
+	my_slave_md5=$(md5sum $SLAVE | awk '{print $1}')
+	master_slave_md5=$(ssh $MASTER "md5sum $SLAVE" | awk '{print $1}')
+	if [ $my_slave_md5 != $master_slave_md5 ]; then
+		slave_log "My slave script is different from master's. Upgrading"
+		scp $MASTER:$SLAVE ${SLAVE}
+		exec $0 $FS $CLIENTS $BENCH_OP $MASTER $CSTART $CEND
+	fi
+	my_bench_md5=$(md5sum $SLAVE_BENCH | awk '{print $1}')
+	master_bench_md5=$(ssh $MASTER "md5sum $SLAVE_BENCH" | awk '{print $1}')
+	if [ $my_bench_md5 != $master_bench_md5 ]; then
+		slave_log "My slave_bench script is different from master's. Upgrading"
+		scp $MASTER:$SLAVE_BENCH ${SLAVE_BENCH}
+	fi
+	slave_log "Check upgrade done."
+}
+
+#####################################################
+# Start slave, just say Hi to master
+# Globals:
+# 	TAG
+# Arguments:
+#	Node
+# Return:
+#	Node
+#####################################################
+function slave_start(){
+	slave_log "Start successfully."
+}
+
+#####################################################
+# Init slave, including clients remount, client log
+# cleanning, etc.
+#
+# Globals:
+# 	TAG
+#	CLIENTS
+# Arguments:
+#	Node
+# Return:
+#	Node
+#####################################################
+function slave_init(){	
+	sig_init=`cat $FLAG_INIT | wc -l`
+	while(($sig_init != 1)); do
+		sleep 0.5
+		sig_init=`cat $FLAG_INIT | wc -l`
+	done
+	# do something
+	slave_log "Initing(remount $FS client)..."
+	/home/ceph/bin/remount-$FS $CSTART $CEND >/dev/null
+	sleep 3
+	slave_log " I am initing..."
+	# init done
+	slave_log "Init over."
+	slave_notify FLAG_INIT_OVER
+}
+
+#####################################################
+# Start benchmark, waiting and send results to master
+#
+# Globals:
+# 	TAG
+#	CLIENTS
+# 	BENCH_OP
+# Arguments:
+#	Node
+# Return:
+#	Node
+#####################################################
+function slave_run(){
+	sig_run=`cat $FLAG_START | wc -l`
+	while(($sig_run != 1)); do
+		sleep 0.5
+		sig_run=`cat $FLAG_START | wc -l`
+	done
+	echo "[START]: "`date`"---">>~/ai-scripts/flag/time
+	# do something
+	slave_log "Starting benchmark daemon idling ..."
+	$SLAVE_BENCH $FS $CLIENTS $BENCH_OP $NAME $CSTART $CEND $MASTER
+
+	slave_log "Run over."
+	slave_notify FLAG_END
+}
+
+#####################################################
+# clean all flags, and die
+# Globals:
+# 	TAG,FLAG
+# Arguments:
+#	Node
+# Return:
+#	Node
+#####################################################
+function slave_end(){
+
+	sleep 10
+	> $FLAG_INIT; > $FLAG_INIT_OVER; > $FLAG_START
+	#scp /var/log/ceph/ceph-client.admin.log ceph@node19:/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/clientLog/clientlog-$NAME
+	slave_log "Say goodbye successfully."
+}
+
+#####################################################
+# Main function
+# Globals:
+#   NAME,FS,CLIENTS,BENCH_OP
+# Arguments:
+#   None
+# Return:
+#   Node
+#####################################################
+#
+# 0. upgrade
+check_upgrade
+#
+# 1. start slave
+slave_start
+#
+# 2. init slave
+slave_init
+#
+# 3. run benchmark
+slave_run
+#
+# 4. clean flags and die
+slave_end

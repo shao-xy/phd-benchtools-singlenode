@@ -1,0 +1,484 @@
+#!/bin/bash
+#
+# Experiment dispatcher, monitor and result collector along with multi-slaves
+#
+#####################################################
+# Global environment and configuration
+#
+# Master Name
+MASTER=
+#
+# File system type, e.g., Ceph, Lustre, etc.
+FS=
+#
+# Benchmark operation type, e.g., create, lookup, etc.
+BENCH_OP=
+#
+EXIT_IMMEDIATELY=
+#
+# Logging for debug and monitor
+TAG=
+#
+# Number of clients, e.g., 100, 200, etc.
+CLIENTS=
+#
+# machine name list, e.g., node19, node18, etc.
+NODES_LIST=
+#
+# Number of slaves or machines, equal to the lenght of nodes array
+SLAVES=
+#
+# NUmber of client per slave/machine
+CLIENTS_PER_SLAVE=
+#
+#-------------------------------------------------
+#
+# Flag - slave initialization
+FLAG_INIT=
+#
+# FLag - slave initialization over
+FLAG_INIT_OVER=
+#
+# Flag - slave start
+FLAG_START=
+#
+# Flag - slave runs over
+FLAG_END=
+#
+# Flag - tell master I have created fileset
+#FLAG_MASTER_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/master_slave_fileset_created
+FLAG_MASTER_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/master_slave_fileset_created
+#
+# Flag - tell master I have created fileset
+FLAG_MASTER_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/master_slave_client_cleaned
+#
+# Flag - tell master to start measuring system information
+#FLAG_MDS_START_SYSINFO=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/mds_start_sysinfo
+FLAG_MASTER_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/master_slave_client_cleaned
+#
+# Flag - tell master to stop measuring system information
+FLAG_MDS_STOP_SYSINFO=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/mds_stop_sysinfo
+#
+# Flag - dirfrag monitor start
+FLAG_DIRFRAGMON_START=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/dirfragmon_run
+#
+# Flag - dirfrag monitor end
+FLAG_DIRFRAGMON_END=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/dirfragmon_stop
+#
+# Mixed workload config
+MIXED_WORKLOAD_CONFIG=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/mixed-conf/current
+
+#
+#------------------------------------------------
+#
+# Program - slave
+PSLAVE=
+#
+
+#####################################################
+# Logging message
+# Globals:
+#   TAG
+# Arguments:
+#   message
+# Return:
+#   Node
+#####################################################
+function master_log(){
+    msg=$1
+    echo -e $TAG $msg
+}
+#####################################################
+
+function lines_of() {
+	while [ "$#" -gt 0 ]; do
+		if test -f $1; then
+			wc -l < $1
+		else
+			echo 0
+		fi
+		shift
+	done
+}
+
+g_has_filebench=False
+g_fb_in_mixed=0
+function read_mixed_workload_config()
+{
+	if [[ "$BENCH_OP" != mixed ]]; then return; fi
+
+	if test ! -f ${MIXED_WORKLOAD_CONFIG}; then
+		master_log "Fatal: workload set to mixed, but configuration file ${MIXED_WORKLOAD_CONFIG} does not exist."
+		master_log "Exiting ..."
+		exit 1
+	fi
+
+	lc=0
+	while read line; do
+		lc=$[lc+1]
+		#echo ${line}
+		read -r -a line_items <<< "$line"
+		if test ${#line_items[@]} -ne 3; then
+			master_log "Conf warningg: the amount of items is not 3, skipped"
+			master_log "   ${MIXED_WORKLOAD_CONFIG}:$lc    $line"
+			continue
+		fi
+		rstart=${line_items[0]}
+		rend=${line_items[1]}
+		key=${line_items[2]}
+		# Check if filebench
+		if [[ "$key" == fb_* ]]; then
+			if [[ $g_has_filebench == False ]]; then
+				g_has_filebench=True
+			fi
+			if [ $rstart -lt $CLIENTS ]; then
+				starter=$CLIENTS
+			else
+				starter=$rstart
+			fi
+			len=$[$rend - $starter + 1]
+			if [ $len -gt 0 ]; then
+				g_fb_in_mixed=$[$g_fb_in_mixed + $len]
+			fi
+		fi
+	done < ${MIXED_WORKLOAD_CONFIG}
+
+	master_log "Read mixed workload success"
+}
+
+function sum_up()
+{
+	line_num=$(lines_of $1)
+	if [ $line_num -eq 0 ]; then
+		echo 0
+	else
+		awk '{sum+=$1} END {print sum}' $1
+	fi
+}
+
+function maybe_handle_filebench_objects()
+{
+	if [[ "$BENCH_OP" != fb_* && "$g_has_filebench" == False ]]; then return; fi
+	if [[ "$g_has_filebench" == True ]]; then
+		local fbw_size=$g_fb_in_mixed
+	else
+		local fbw_size=$CLIENTS
+	fi
+	clients_created=$(sum_up $FLAG_MASTER_CREATED)
+	while [ $clients_created -lt $fbw_size ]; do
+		master_log "($clients_created/$fbw_size) filebench workload instances have created fileset, waiting..."
+		sleep 1
+		clients_created=$(sum_up $FLAG_MASTER_CREATED)
+	done
+
+	master_log "Lines: $(lines_of $FLAG_MASTER_CREATED)"
+	declare -a slaves
+	# All slaves have created filesets, tell them to continue
+	while read line; do
+		read -r clients slave <<< "$line"
+		master_log "$slave"
+		# Mysterious bug
+		#ssh $slave "echo 1 > $FLAG_MASTER_CLEANED"
+		slaves+=("$slave")
+	done < $FLAG_MASTER_CREATED
+	
+	for slave in ${slaves[@]}; do
+		ssh $slave "echo 1 > $FLAG_MASTER_CLEANED"
+	done
+}
+
+#####################################################
+# Init global environment and configuration
+# Globals:
+#   MASTER
+#   FS
+#   TAG
+#   BENCH_OP
+#   CLIENTS
+#   NODES_LIST
+#   SLAVES
+#   CLIENTS_PER_SLAVE
+#   FLAG_INIT
+#   FLAG_INIT_OVER
+#   FLAG_START
+#   FLAG_END
+#   PSLAVE
+# Arguments:
+#   fs
+#   clients
+#   operation
+# Return:
+#   None 
+#####################################################
+function master_config(){
+    FS=$1
+    TAG="\033[1;31m[Logging $FS Dispatcher]\033[0m"
+    CLIENTS=$2
+    BENCH_OP=$3
+	EXIT_IMMEDIATELY=$4
+    MASTER=`cat /etc/hostname`
+
+    
+	#NODES_LIST=(19)
+    #NODES_LIST=(18 17)
+	#NODES_LIST=(19 18 17 15 14 9 8 7)
+	NODES_LIST=(19 18 17 15 14)
+
+    MDS_LIST=(1 2 3 4 5)
+    #MDS_LIST=(10 13)
+    #MDS_LIST=(1)
+	MDSs=${#MDS_LIST[@]}
+	#NODES_LIST=(19 15 14)
+    SLAVES=${#NODES_LIST[@]}
+    CLIENTS_PER_SLAVE=$(($CLIENTS/$SLAVES))
+
+    FLAG_INIT=$PWD/flag/init; > $FLAG_INIT
+    FLAG_INIT_OVER=$PWD/flag/init_over; > $FLAG_INIT_OVER
+    FLAG_START=$PWD/flag/start; > $FLAG_START
+    FLAG_END=$PWD/flag/end; > $FLAG_END
+
+    PSLAVE=$PWD/slave
+
+    if [ ! -d $RES ]; then
+        mkdir -p $RES
+    fi
+
+    > $FLAG_MASTER_CREATED
+    > $FLAG_MASTER_CLEANED
+	> $FLAG_MDS_START_SYSINFO
+	> $FLAG_MDS_STOP_SYSINFO
+
+    # Print global configuration
+    echo -e "$TAG ---Global Configuration---"
+    echo "Benchmark FS        : $FS"
+    echo "Benchmark operation : $BENCH_OP"
+    echo "CLients             : $CLIENTS"
+    echo "Machines/Slaves     : $SLAVES"
+    echo "Nodes               : ${NODES_LIST[*]}"
+    echo "Clients per machine : $CLIENTS_PER_SLAVE"
+    echo -e "$TAG --------------------------"
+    master_log "Global initialization success." 
+    echo ""
+
+}
+
+#####################################################
+# Start all slaves
+# Globls:
+#   FS
+#   BENCH_OP
+#   NODES_LIST
+#   SLAVES
+#   CLIENTS_PER_SLAVE
+#   PSLAVE
+# Arguments:
+#   Node
+# Return:
+#   Node
+#####################################################
+function master_start_slaves(){
+    master_log "-------Start slaves-------"
+    master_log "-------Clean old things-------"
+	./cleanAllTraceLog
+    for i in `seq 1 $SLAVES`; do
+        slave=node${NODES_LIST[$(($i-1))]}
+        master_log "Starting $slave..."
+        cstart=$((($i-1) * $CLIENTS_PER_SLAVE + 1))
+        cend=$(($cstart + $CLIENTS_PER_SLAVE -1))
+        ssh $slave $PSLAVE $FS $CLIENTS_PER_SLAVE $BENCH_OP $MASTER $cstart $cend &
+    done
+    sleep 5
+    master_log "--------------------------"
+    echo ""
+}
+
+#####################################################
+# Init all slaves, set init flag, and wait all slaves
+# init over, then return
+#
+# Globls:
+#   FS
+#   BENCH_OP
+#   NODES_LIST
+#   SLAVES
+#   CLIENTS_PER_SLAVE
+# Arguments:
+#   Node
+# Return:
+#   Node
+#####################################################
+function master_init_slaves(){
+    master_log "-------Init slaves--------"
+
+    for i in `seq 1 $SLAVES`; do
+        slave=node${NODES_LIST[$(($i-1))]}
+        master_log "Initing $slave..."
+        ssh $slave "echo 1 > $FLAG_INIT"
+    done
+
+    # Wait all slaves init over
+    sig_init_over=`cat $FLAG_INIT_OVER | wc -l`
+    while(( $sig_init_over != $SLAVES )); do
+        master_log "Waiting slave inits..."
+        sleep 1
+        sig_init_over=`cat $FLAG_INIT_OVER | wc -l`
+    done
+    master_log "All slaves init over successfully."
+    master_log "--------------------------"
+	master_log "Starting dirfrag monitor process"
+	echo 0 > $FLAG_DIRFRAGMON_START
+	echo 0 > $FLAG_DIRFRAGMON_END
+	./Dirfrag_monitor &
+    master_log "--------------------------"
+    echo ""
+}
+
+#####################################################
+# Tell all slaves to do benchmark and wait until over
+#
+# Globls:
+#   FS
+#   BENCH_OP
+#   NODES_LIST
+#   SLAVES
+#   CLIENTS_PER_SLAVE
+# Arguments:
+#   Node
+# Return:
+#   Node
+#####################################################
+function master_run_slaves(){
+    master_log "-------Run slaves--------"
+	#./fim_mds_clean
+    for i in `seq 1 $SLAVES`; do
+        slave=node${NODES_LIST[$(($i-1))]}
+        master_log "Running $slave..."
+        ssh $slave "echo 1 > $FLAG_START"
+    done
+	echo 1 > $FLAG_DIRFRAGMON_START
+
+	#MDSStart=`cat $FLAG_MDS_START_SYSINFO | wc -l`
+	#while(( $MDSStart == 0 )); do
+	#	sleep 0.5
+	#	MDSStart=`cat $FLAG_MDS_START_SYSINFO | wc -l`
+	#done
+
+    master_log "-------CLEAN LOG--------"
+    for i in `seq 1 5`; do
+		ssh node$i "~/duo/clear_node_mds_log"
+	done
+
+    master_log "-------Start to get system info--------"
+    for i in `seq 1 $MDSs`; do
+	    mds=node${MDS_LIST[$(($i-1))]}
+	    #echo -e "---\nTEST, DONT GET INFO\n---"
+		#ssh ceph@$mds /home/ceph/duo/getSystemInfo &
+	done
+
+	maybe_handle_filebench_objects
+
+    # Wait all slaves run over
+	tick=0
+    sig_end=`cat $FLAG_END | wc -l`
+    while(( $sig_end != $SLAVES )); do
+		tick=$(($tick+1))
+        master_log "No.$tick, Waiting slave runs..."
+        sleep 1
+        sig_end=`cat $FLAG_END | wc -l`
+    done
+
+	for i in `seq 1 $MDSs`; do
+		mds=node${MDS_LIST[$(($i-1))]}
+		ssh ceph@$mds cp /var/log/ceph/ceph-mds.mds$i-1.log /var/log/ceph/mds$i-1.log
+		ssh ceph@$mds cp /var/log/ceph/ceph-mds.mds$i-2.log /var/log/ceph/mds$i-2.log
+	done
+
+	master_log "-------Stop to get system info--------"
+	sleep 1
+	#to avoid getSystemInfo not start yet
+	test ! -d ./mds-log && mkdir ./mds-log
+	for i in `seq 1 $MDSs`; do
+		mds=node${MDS_LIST[$(($i-1))]}
+	    #echo -e "---\nTEST, DONT STOP INFO\n---"
+		#ssh ceph@$mds /home/ceph/duo/stopGetSystemInfo
+		#scp ceph@$mds:/var/log/ceph/ceph-mds.mds$i-1.log ./mds-log/
+		#scp ceph@$mds:/var/log/ceph/ceph-mds.mds$i-2.log ./mds-log/
+		scp ceph@$mds:/var/log/ceph/mds$i-1.log ./mds-log/
+		scp ceph@$mds:/var/log/ceph/mds$i-2.log ./mds-log/
+		#scp ceph@$mds:/var/log/ceph/ceph-mds.mds$i-3.log ./mds-log/
+	done
+
+	echo 1 > $FLAG_DIRFRAGMON_END
+	wait
+	master_log "All slaves stops successfully."
+    master_log "--------------------------"
+    echo ""
+}
+
+#####################################################
+# Evaluate performance according to results from slaves
+#
+# Globls:
+#   RES,SLAVES
+# Arguments:
+#   Node
+# Return:
+#   Node
+#####################################################
+function master_analyse_log(){
+	echo "run mds log analyse"
+	test ! -d ./client-log && mkdir ./client-log
+	#mkdir tempTrace
+	test ! -d ./endtime && mkdir ./endtime
+	for i in `seq 1 $SLAVES`; do 
+		slave=node${NODES_LIST[$(($i-1))]}
+		scp ceph@$slave:/var/log/ceph/ceph-client.admin.log ./client-log/$slave
+	#	scp ceph@$slave:/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/traceLog/* /home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/tempTrace/
+		scp ceph@$slave:ai-scripts/flag/time ./endtime/endtime-$slave
+	done
+}
+#####################################################
+# Main function
+#####################################################
+# 1. Check arguments
+if [ "$#" -ne 3 -a $# -ne 4 ]; then
+    master_log "Arguments Error!"
+	master_log "Arguments: 1. File System; 2. # Clients; 3. Benchmark type(create, lookup...) [ 4. nowait (after the job is finished) ]"
+    exit 1
+fi
+#
+# 2.0 Check if any screen running
+if test $(screen -ls | grep ^No | wc -l) -eq 0; then
+	echo "Warning: There's already screen running:"
+	screen -ls
+	echo "Hint: This process itself might ALSO BE SEEN in the list above if started with screen."
+	echo
+	echo "Press [Ctrl-C] to quit in 60 seconds. The process will continue after that."
+	echo "You can immediately start by pressing [Enter]."
+	read -t 60
+fi
+#
+# 2. Init global configuration
+master_config $1 $2 $3 $4
+# 2.1 Init mixed workload configuration
+read_mixed_workload_config
+#
+# 3. Start slaves, just start w/o any operations
+master_start_slaves
+#
+# 4. Init slaves
+master_init_slaves
+#
+# 5. Tell slaves to do benchamrk
+master_run_slaves
+#
+# 6. Compute performance
+master_analyse_log
+
+# Wait for exit
+date
+if [[ "$EXIT_IMMEDIATELY" ]]; then
+	exit 0
+fi
+read -p "Press [Enter] to continue, or press [s-Enter] to start a shell: " c
+test "$c" == "s" && echo "Starting a new shell. (Press [Ctrl-D] or run \"exit\" to exit)" && bash

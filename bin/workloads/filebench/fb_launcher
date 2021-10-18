@@ -1,0 +1,44 @@
+#!/bin/bash
+
+op=$1
+workerid=$2
+if [ -z $3 ]; then
+	targetid=$workerid
+else
+	targetid=$3
+fi
+if [ -z $4 ]; then
+	TARGETDIR_PREFIX=\\/mnt\\/ceph-client
+else
+	TARGETDIR_PREFIX=$3
+fi
+
+FB_BASEDIR=/home/ceph/sxy/filebench/filebench
+FB_WORKLOADDIR=$FB_BASEDIR/workloads
+FB_LOG=/home/ceph/evaluations/coll/fb_templogs/$op-${workerid}.log
+
+FILEBENCH_EXE=$FB_BASEDIR/filebench
+
+targetdir=$FB_WORKLOADDIR/$op
+targetfile=$targetdir/$workerid.f
+
+if [ -f $targetfile ]; then
+	if [ ! -d $targetdir.old ]; then
+		mkdir $targetdir.old
+	fi
+	mv $targetfile $targetdir.old/$workerid.f
+fi
+
+if [ ! -d $targetdir ]; then
+	mkdir $targetdir
+fi
+
+cp $FB_WORKLOADDIR/$op.f $targetfile
+
+# replace FS directory
+sed -i 's/set $dir=\/tmp/set $dir='$TARGETDIR_PREFIX-$workerid'\/filebench\/'$OP'/' $targetfile
+# replace benchmark direcotry, e.g., bigfileset + No.client
+sed -i 's/name=bigfileset/name=bigfileset-'$targetid'/' $targetfile
+
+## 2. Start Filebench, create fileset, tell master about this and wait
+$FILEBENCH_EXE -f $targetfile > ${FB_LOG}

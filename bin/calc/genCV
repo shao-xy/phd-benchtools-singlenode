@@ -1,0 +1,46 @@
+#!/bin/bash
+target=$1
+if [ -d $target ] ; then
+	echo "Current Dir: $target"
+else
+	echo "dir $target is Not exist"
+	exit 0
+fi
+
+cd $target
+
+paste IOPS-mds*-minute | awk '{printf "%d %d %d %d %d %d\n", $1, $2, $4, $6, $8, $10}' > tempIOPS.txt
+
+#start=true
+
+echo -e "#NO\tAggregateIOPS\tCoV\tRange \tMax \tIF" > CV.txt
+
+cap=6000
+num=5
+
+while read line; do
+  start=true
+  iopsList=()
+  lenth=0
+  for i in $line; do
+	if [ "$start" = true ]; then
+	  NO=$i
+	  start=false
+	else
+	  iopsList[$lenth]=$i
+	  let lenth+=1
+	fi
+  done
+  #echo ${iopsList[@]}
+  read totalIOPS meanV sstV rangeV maxV <<< $(echo $(echo ${iopsList[@]} | xargs -n1 | datamash -W sum 1 mean 1 sstdev 1 range 1 max 1))
+  if [ $sstV == 0 ] ; then 
+    CV=0
+  else
+    read CV <<< $(echo $(echo $sstV $meanV | awk '{print $1/$2}'))
+  fi
+  IF=`awk 'BEGIN {printf "%f\n",(1/(1+exp(1)**(-(('"$maxV"'/'"$cap"')*20-10))))*'"$CV"'/sqrt('"$num"')}'`
+  echo $NO $totalIOPS $CV $rangeV $maxV $IF >> CV.txt
+  echo -ne "Calculating: No.$NO\033[K\r"
+done < tempIOPS.txt
+
+echo -e "\033[K\rDown."

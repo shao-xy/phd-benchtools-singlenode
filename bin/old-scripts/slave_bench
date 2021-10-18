@@ -1,0 +1,514 @@
+#!/bin/bash
+#
+# Benchmark runner and result sender
+#
+#####################################################
+# Global configuration
+#
+# My name
+NAME=`cat /etc/hostname`
+
+# File system benchmarked
+FS=$1
+#
+# Number of clients
+CLIENTS=$2
+#
+# Benchmarked operation
+OP=$3
+#
+# Slave tag
+SLAVE=$4
+#
+# Client - start
+CSTART=$5
+#
+# Client - end
+CEND=$6
+#
+# Master
+MASTER=$7
+#
+# Mixed child process flag
+MIXED=$8
+#
+# Benchmarking in this slave node
+TAG="\033[1;32m[Benchmarking FS $FS Slave $SLAVE OP $MIXED$OP]\033[0m"
+#
+#AI
+AITOOL=/home/ceph/cyx/mxnet/src-code/incubator-mxnet/tools/im2rec.py
+#
+
+# Benchmark directory according to FS prefix
+DIR=\\/mnt\\/$FS-client
+#
+# Temporal directory for output of filebench
+FB_LOG=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/fb_templogs/output-$FS-client
+#
+#
+# Flag - how many clients have created
+#FLAG_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/fileset_created
+FLAG_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/fileset_created
+#
+# Flag - tell clients they can continue(cache has been cleaned up)
+#FLAG_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/client_cleaned
+FLAG_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/client_cleaned
+#
+# Flag - tell master I have created fileset
+#FLAG_MASTER_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/master_slave_fileset_created
+FLAG_MASTER_CREATED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/master_slave_fileset_created
+#
+# Flag - tell master I have created fileset
+#FLAG_MASTER_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/master_slave_client_cleaned
+FLAG_MASTER_CLEANED=/home/ceph/cyx/metadata-management/experiments/scripts/flag/master_slave_client_cleaned
+#
+# Flag - record the completed clients to notify master to stop get system info
+FLAG_CLIENTS_COMPLETED=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/clients_completed
+#
+# Flag - tell master to start measuring system information
+FLAG_MDS_START_SYSINFO=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/mds_start_sysinfo
+#
+# Flag - tell master to stop measuring system information
+FLAG_MDS_STOP_SYSINFO=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/mds_stop_sysinfo
+
+YCSB_SCRIPT=/home/ceph/duo/YCSB-C/ycsbc
+
+YCSB_DIR=/home/ceph/duo/YCSB-C/
+
+FILEBENCH_EXE=/home/ceph/cyx/filebench/filebench
+
+TRACE_REPLAY_OLD_SCRIPT=/home/ceph/duo/traceReplay/replayTrace
+
+TRACE_REPLAY_SCRIPT=/home/ceph/duo/traceReplay_multiThread/build/replayTraceMultiThread
+
+TRACE_DIR_PATH=/home/ceph/cyx/trace
+
+MIXED_WORKLOAD_CONFIG=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/mixed-conf/current
+
+COMPLETE_TIME=/home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training/flag/time
+
+FB_WORKLOADS_BASEDIR=/home/ceph/cyx/filebench/workloads
+#
+#####################################################
+
+#####################################################
+# Logging message
+# Globals:
+# 	TAG
+# Arguments:
+#	message
+# Return:
+#	Node
+#####################################################
+function bench_log(){
+	msg=$1
+	echo -e $TAG $msg
+}
+
+function lines_of() {
+	while [ "$#" -gt 0 ]; do
+		if test -f $1; then
+			wc -l < $1
+		else
+			echo 0
+		fi
+		shift
+	done
+}
+
+g_has_filebench=False
+function maybe_wait_for_filebench() {
+	if [ "$g_has_filebench" == False ]; then
+		return
+	fi
+	len=$(lines_of $FLAG_MASTER_CLEANED)
+	while test $len -lt 1; do
+		sleep 1
+		len=$(lines_of $FLAG_MASTER_CLEANED)
+	done
+}
+
+#####################################################
+# Do my work for Zipfian workload (Filebench version)
+# Arguments:
+#   $1: operation
+#	$2: slave worker id
+# Return:
+#   None
+#####################################################
+function do_my_fb()
+{
+	# 0. parameters
+	op=$1
+	workerid=$2
+
+	## 1. Create workload configuration file from template
+	bench_log "Filebench workload init..."
+	local targetdir=$FB_WORKLOADS_BASEDIR/$op
+	local targetfile=$targetdir/$workerid.f
+	if [ -f $targetfile ]; then
+		if [ ! -d $targetdir.old ]; then
+			mkdir $targetdir.old
+		fi
+		mv $targetfile $targetdir.old/$workerid.f
+	fi
+
+	if [ ! -d $targetdir ]; then 
+		mkdir $targetdir
+	fi
+
+	cp $FB_WORKLOADS_BASEDIR/$op.f $targetfile
+	# replace FS directory
+	sed -i 's/set $dir=\/tmp/set $dir='$DIR-$workerid'\/filebench\/'$OP'/' $targetfile
+	# replace benchmark direcotry, e.g., bigfileset + No.client
+	sed -i 's/name=bigfileset/name=bigfileset-'$workerid'/' $targetfile
+
+	## 2. Start Filebench, create fileset, tell master about this and wait
+	$FILEBENCH_EXE -f $targetfile > ${FB_LOG}-$workerid &
+
+	# Now waits for master's start signal
+	bench_log "Waits for master's signal."
+	wait_count=0
+	clean=$(lines_of $FLAG_MASTER_CLEANED)
+	while [ $clean -lt 1 ]; do
+		sleep 1
+		wait_count=$[$wait_count + 1]
+		bench_log "Waits for master's signal. (have waited for $wait_count seconds)"
+		clean=$(lines_of $FLAG_MASTER_CLEANED)
+	done
+	bench_log "Master orders me to start benchmarks. Clean client cache first"
+	sleep 10
+
+	# We don't sleep now. The parent process is sleeping for 300 seconds before activating filebench instances
+	/home/ceph/bin/remount-$FS $workerid $workerid
+	#/home/ceph/bin/remount-$FS $workerid $workerid fsleep
+
+	sleep 10
+	bench_log "Client cache cleaned, filebench benchmark continues :)"
+	wait
+}
+
+#####################################################
+# Read configuration for mixed workloads
+# Arguments:
+#	None
+# Return:
+#   None
+#####################################################
+declare -A MIXED_WORKLOADS
+g_fb_in_mixed=0
+function read_mixed_workload_config()
+{
+	if [[ "$OP" != mixed ]]; then return; fi
+
+	if test ! -f ${MIXED_WORKLOAD_CONFIG}; then
+		bench_log "Fatal: workload set to mixed, but configuration file ${MIXED_WORKLOAD_CONFIG} does not exist."
+		bench_log "Exiting ..."
+		exit 1
+	fi
+
+	lc=0
+	while read line; do
+		lc=$[lc+1]
+		#echo ${line}
+		read -r -a line_items <<< "$line"
+		if test ${#line_items[@]} -ne 3; then
+			bench_log "Conf warningg: the amount of items is not 3, skipped"
+			bench_log "   ${MIXED_WORKLOAD_CONFIG}:$lc    $line"
+			continue
+		fi
+		rstart=${line_items[0]}
+		rend=${line_items[1]}
+		range="${rstart},${rend}"
+		key=${line_items[2]}
+		value=${MIXED_WORKLOADS[$key]}
+		if [ ! "$value" ]; then
+			MIXED_WORKLOADS+=([${key}]=${range})
+		else
+			value="$value|$range"
+			MIXED_WORKLOADS[$key]=$value
+		fi
+		# Check if filebench
+		if [[ "$key" == fb_* ]]; then
+			# Check this range overlaps with the current range
+			local mstart=0
+			local mend=0
+			if [ $rstart -lt $CSTART ]; then
+				mstart=$CSTART
+			else
+				mstart=$rstart
+			fi
+			if [ $rend -lt $CEND ]; then
+				mend=$rend
+			else
+				mend=$CEND
+			fi
+			overlap_nums=$[ $mend - $mstart + 1]
+			if [ $overlap_nums -gt 0 ]; then
+				g_has_filebench=True
+				g_fb_in_mixed=$[$g_fb_in_mixed + $overlap_nums]
+			fi
+		fi
+	done < ${MIXED_WORKLOAD_CONFIG}
+
+	# Debug
+	#for key in ${!MIXED_WORKLOADS[@]}; do
+	#	range=${MIXED_WORKLOADS[$key]}
+	#	echo ${range}, $key
+	#done
+
+	bench_log "Read mixed workload success"
+}
+read_mixed_workload_config
+
+#####################################################
+# do mixed for one client
+# Parameters:
+#   $1: my ID
+#####################################################
+function do_my_mixed()
+{
+	# 0. Parameter: who am I?
+	whoami=$1
+
+	target_workload=
+	# 1. Find myself in the configuration file
+	for key in ${!MIXED_WORKLOADS[@]}; do
+		ranges=${MIXED_WORKLOADS[$key]}
+		oldifs=$IFS
+		IFS="|"
+		read -ra RANGES_ARRAY <<< "$ranges"
+		for range in ${RANGES_ARRAY[@]}; do
+			IFS=","
+			read -r rstart rend <<< "${range}"
+			#echo $rstart, $rend
+			if test $1 -ge $rstart -a $1 -le $rend; then
+				target_workload=$key
+				break
+			fi
+			IFS=""
+		done
+		if [ "$target_workload" ]; then
+			IFS=$oldifs
+			break
+		fi
+		IFS=$oldifs
+	done
+
+	if [ ! $target_workload ]; then
+		bench_log "Warning: Slave ID $1 not in mixed workload configuration file. Doing nothing"
+		return
+	fi
+
+	$0 $FS $CLIENTS $target_workload $SLAVE $1 $1 $MASTER mixed\($1\)-
+}
+
+#####################################################
+# Init benchmark environment, including generate workloads,
+# remove old benchmark directory
+# Globals:
+# 	TAG,FB,FB_WORKLOADS,OP,CLIENTS
+# Arguments:
+#	message
+# Return:
+#	Node
+#####################################################
+function bench_init(){
+	bench_log "Benchmark initing..."
+
+	if [ $OP == "ai" ]; then
+		bench_log "make data and record dir"
+		#for i in `seq $CSTART $CEND`; do
+		#	mkdir -p /mnt/ceph-client-$i/record/imagenet-record-$i
+		#done
+	elif [[ $OP == "tar_init" || $OP == "tar_run" || $OP == "web_init" || $OP == "web_run" || $OP == "web_init80" || $OP == "web_run80" || $OP == "s_tar_init" || $OP == "s_tar_run" || $OP == "s_compilation_init" || $OP == "s_compilation_run" || $OP == "s_web_init80" || $OP == "s_web_run80" || $OP == "compilation_init" || $OP == "compilation_run" || $OP == "untar_init" || $OP == "untar_run" || $OP == "clear_trace" || $OP == "zipfread_run" || $OP == "zipfread_init" || $OP == "zipfread_clear" || $OP == "compilation_data_init" || $OP == "compilation_data_run" || $OP == fb_* || $OP == "mixed" ]]; then
+		bench_log "start to traceReplay"
+	else
+		echo "this script could only run AI, trace, zipf, exit"
+		exit
+	fi
+	wait
+	bench_log "Benchmark init over."
+}
+
+#####################################################
+# Run benchmark, e.g., create, stat, etc.
+# Globals:
+# 	TAG,FB,FB_WORKLOADS,OP,CLIENTS
+# Arguments:
+#	message
+# Return:
+#	Node
+#####################################################
+function bench_run(){
+	bench_log "Benchmark running..."
+
+	rm -f /home/ceph/cyx/metadata-management/experiments/scripts/tmp/*
+
+	# Operation applies to:
+	# 1. filebench workloads themselves (but should not be those from mixed workload, whose variable "MIXED" is not null)
+	# 2. The mixed master (variable "g_has_filebench" is true only if the process is master
+	if [[ "$OP" == fb_* && ! "$MIXED" ]] || [[ "$g_has_filebench" == True ]]; then
+		rm $FLAG_CREATED
+		rm $FLAG_CLEANED
+		> $FLAG_MASTER_CREATED
+		> $FLAG_MASTER_CLEANED
+	fi
+
+	# Force other benchmarks to wait for filebench
+	if [[ "$OP" != fb_* && "$MIXED" ]]; then
+		maybe_wait_for_filebench
+	fi
+
+	#if [ ! "$MIXED" ]; then
+	#	echo > $FLAG_CLIENTS_COMPLETED
+	#fi
+
+	for i in `seq $CSTART $CEND`; do
+		if [[ $OP == "ai" ]]; then
+			#data=/mnt/$FS-client-$i/
+			data=/mnt/$FS-client-$i/ai
+			record=/home/ceph/duo/genImagenet/record/imagenet-record-$i/$i
+			(python3 $AITOOL --list --recursive $record ${data}/ ; python3 $AITOOL --list --recursive $record ${data}_1/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			#(python3 $AITOOL --list --recursive $record ${data}/ ; python3 $AITOOL --list --recursive $record ${data}_1/ ; python3 $AITOOL --list --recursive $record ${data}_2/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			#(python3 $AITOOL --list --recursive $record ${data}/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			# (python3 $AITOOL --list --recursive $record $data/; python3 $AITOOL --resize 224 --num-thread 8 ${record}.lst $data/) &
+		# shared data
+		elif [[ $OP == "s_compilation_init" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_compilation init /mnt/ceph-client-$i/ &
+		elif [[ $OP == "s_compilation_run" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_compilation run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "s_web_init80" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log_80p init /mnt/ceph-client-$i/ &
+		elif [[ $OP == "s_web_run80" ]]; then
+			#($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log_80p run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log_48p run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "s_tar_init" ]]; then
+			#$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress init /mnt/ceph-client-$i/ &
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress_11 init /mnt/ceph-client-$i/ &
+		elif [[ $OP == "s_tar_run" ]]; then
+			#($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress_11 run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			#($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress_single run /mnt/ceph-client-$i/ $i ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		
+		# exclusive data
+		elif [[ $OP == "compilation_data_init" ]]; then
+			cp -r /home/ceph/duo/linux /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "compilation_data_run" ]]; then
+			cd /mnt/ceph-client-$i/trace-$i/linux-5.1.12/
+			make >> /dev/null &
+			cd /home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training
+		elif [[ $OP == "tar_init" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress init /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "tar_run" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_compress run /mnt/ceph-client-$i/trace-$i/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "compilation_init" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_compilation init /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "compilation_run" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_compilation run /mnt/ceph-client-$i/trace-$i/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "web_init" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log init /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "web_run" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log run /mnt/ceph-client-$i/trace-$i/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "web_init80" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log_80p init /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "web_run80" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_web_access_log_80p run /mnt/ceph-client-$i/trace-$i/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "untar_init" ]]; then
+			$TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_uncompress init /mnt/ceph-client-$i/trace-$i/ &
+		elif [[ $OP == "untar_run" ]]; then
+			($TRACE_REPLAY_SCRIPT $TRACE_DIR_PATH/trace_tar_uncompress run /mnt/ceph-client-$i/trace-$i/ ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+		elif [[ $OP == "zipfread_run" ]]; then
+			cd $YCSB_DIR
+			export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+			($YCSB_SCRIPT -db basic -threads 1 -P $YCSB_DIR/workloads/zipfread.spec -n $i -mode r ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			cd /home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training
+		elif [[ $OP == "zipfread_init" ]]; then
+			cd $YCSB_DIR
+			export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+			($YCSB_SCRIPT -db basic -threads 1 -P $YCSB_DIR/workloads/zipfread.spec -n $i -mode l ; echo "$OP $i "`date` >> $COMPLETE_TIME )&
+			cd /home/ceph/cyx/metadata-management/experiments/scripts/migrate/ai-training
+		elif [[ $OP == "zipfread_clear" ]]; then
+			if test -d /mnt/ceph-client-$i/ycsbzipf/usertable$i; then
+				###### rm -rf $YCSB_DIR/ & # 删库跑路真刺激 -- 20200317 Daniel
+				rm -rf /mnt/ceph-client-$i/ycsbzipf/usertable$i &
+			fi
+		elif [[ $OP == "clear_trace" ]]; then
+			rm -rf /mnt/ceph-client-$i/trace-$i/* &
+		elif [[ $OP == fb_* ]]; then
+			do_my_fb $OP $i &
+		elif [[ $OP == "mixed" ]]; then
+			do_my_mixed $i &
+		fi
+		echo -e "---\nrun $i\n---"
+	done
+
+	if [[ "$OP" == fb_* && ! "$MIXED" ]] || [[ "$g_has_filebench" == True ]]; then
+		if [[ "$g_has_filebench" == True ]]; then
+			local fbw_size=$g_fb_in_mixed
+		else
+			local fbw_size=$[ $CEND - $CSTART + 1]
+		fi
+		bench_log "Pause and clean filebench instance cache"
+		clients_created=$(lines_of $FLAG_CREATED)
+		while [ $clients_created -lt $fbw_size ]; do
+			bench_log "($clients_created/$fbw_size) filebench workload instances have created fileset, waiting..."
+			sleep 1
+			clients_created=$(lines_of $FLAG_CREATED)
+		done
+
+		ssh $MASTER "echo $fbw_size $NAME >> $FLAG_MASTER_CREATED"
+
+		# We don't follow the old step here. Filebench instances will do it on their own.
+		# We just sleep 5 minutes to make sure all instances have done
+		sleep 300
+		# Now waits for master's start signal
+		#bench_log "Waits for master's signal."
+		#wait_count=0
+		#clean=$(lines_of $FLAG_MASTER_CLEANED)
+		#while [ $clean -lt 1]; do
+		#	sleep 1
+		#	wait_count=$[$wait_count + 1]
+		#	#bench_log "Waits for master's signal. (have waited for $wait_count seconds)"
+		#	clean=$(lines_of $FLAG_MASTER_CLEANED)
+		#done
+		#bench_log "Master orders me to start benchmarks. Clean client cache first"
+		#sleep 10
+
+		#/home/ceph/bin/remount-$FS $CSTART $CEND fsleep
+
+		#sleep 10
+		#bench_log "Client cache cleaned, filebench benchmark continues :)"
+		echo 1 > $FLAG_CLEANED
+	fi
+
+	if [ ! "$MIXED" ]; then
+		echo 1 > $FLAG_CLEANED
+		ssh $MASTER "echo 1 >> $FLAG_MDS_START_SYSINFO"
+	fi
+#
+#	client_completed=`cat $FLAG_CLIENTS_COMPLETED | wc -l`
+#	while(( $client_completed < 1)); do
+#		sleep 1
+#		client_completed=`cat $FLAG_CLIENTS_COMPLETED | wc -l`
+#	done
+#	bench_log "I have a client has run benchmark done, now notify master stop measuring system information."
+#	ssh $MASTER "echo 1 >> $FLAG_MDS_STOP_SYSINFO"	
+
+	wait
+	bench_log "Benchmark run over."
+}
+
+#####################################################
+# Main function
+# Globals:
+#	FS,CLIENTS,OP,TAG
+# Return:
+#	Node
+#####################################################
+
+# 1. Init benchmark environment
+bench_init
+#
+# 2. Run benchmark
+bench_run
